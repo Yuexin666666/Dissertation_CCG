@@ -1,0 +1,722 @@
+---
+title: "session1"
+author: "Yuexin Cui"
+date: "2020/6/8"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## Packages
+
+```{r}
+library("reticulate")
+library("data.table")
+library("plyr")
+library("dplyr")
+library("ggplot2")
+library("karyoploteR")
+library("regioneR")
+library("RIdeogram")
+library("chromoMap")
+
+```
+
+Read in the pickle file as data table:
+```{r}
+
+source_python("read_pickle.py")
+pickle.list <- read_pickle_file("~/Data/codon_mutability.pickle")
+
+pickle.df <- ldply(pickle.list, data.frame)
+names(pickle.df) <- c("codon", "mutability")
+
+pickle.dt <- data.table(pickle.df)
+
+```
+
+Read in the genie file as data table:
+```{r}
+
+genie.dt <- fread("~/Data/genie_data_mutations_extended.txt", header = T)
+
+```
+
+import the test dataset:
+```{r}
+
+tcga.dt <- fread("~/Data/pre_tcga_mutations_data.txt", header = T)
+
+```
+
+### GENIE Data
+
+Filter the rows to get only the point mutations in the genie data:
+```{r}
+
+point.dt <- genie.dt[Variant_Classification == "Missense_Mutation" & 
+           Variant_Type == "SNP",]
+stopifnot(point.dt$Start_Position == point.dt$End_Position)
+
+```
+
+Investigate the number of missing values in column HGVSp_Short:
+```{r}
+
+sum(is.na(point.dt$HGVSp_Short))
+sum(point.dt$HGVSp_Short == "")
+
+sum(is.na(point.dt$Hugo_Symbol))
+sum(point.dt$Hugo_Symbol == "")
+
+```
+
+Delete the one row with missing HGVSP_Short:
+```{r}
+
+missing.ind <- which(point.dt$HGVSp_Short == "")
+point.dt <- point.dt[!missing.ind]
+stopifnot(sum(point.dt$HGVSp_Short == "") == 0)
+
+```
+
+Define a function to extract the middle part of codons from HGVSP_Short:
+```{r}
+
+extract_pat <- function(str) {
+  return(stringr::str_match(str, "p\\.([[:upper:]]+\\d+)")[2])
+}
+
+```
+
+
+construct the codon column in the genie dataset:
+```{r}
+
+point.dt$codon <- unlist(lapply(point.dt$HGVSp_Short, extract_pat))
+point.dt$codon <- paste(point.dt$Hugo_Symbol, point.dt$codon, sep = "_")
+
+```
+
+compare the unique values of codon columns in the two datasets (codons in the pickle file is a subset of those in the point.dt):
+```{r}
+
+length(setdiff(point.dt$codon, pickle.dt$codon))
+length(setdiff(pickle.dt$codon, point.dt$codon))
+length(unique(point.dt$codon))
+
+```
+
+merge with the codon-mutability data table to delete the codons without baseline mutability:
+```{r}
+
+point.mut.dt <- merge(point.dt, pickle.dt, by = "codon")
+
+
+```
+
+check missing values:
+```{r}
+
+sum(is.na(point.mut.dt$codon))
+sum(is.na(point.mut.dt$mutability))
+
+sum(point.mut.dt$codon == "")
+sum(point.mut.dt$mutability == "")
+
+length(unique(point.mut.dt$codon))
+
+```
+
+calculate the observed number of mutations in each codon:
+```{r}
+
+codon.obs.dt <- point.mut.dt %>%
+  group_by(codon) %>%
+  summarize(obs_count = n())
+
+```
+
+construct a data table with codon, obs.count, mutability:
+```{r}
+
+codon.info.dt <- merge(codon.obs.dt, pickle.dt, by = "codon")
+
+```
+
+add expect.count column:
+```{r}
+
+n.sample <- nrow(point.dt)
+codon.info.dt$expect_count <- codon.info.dt$mutability * n.sample
+codon.info.dt$inv_expect_count <- (1 - codon.info.dt$mutability) * n.sample
+
+```
+
+calculate significance scores:
+```{r}
+
+num.codon <- nrow(codon.info.dt)
+p <- numeric(num.codon)
+
+for(i in 1:num.codon) {
+  mut <- codon.info.dt$mutability[i]
+  obs <- codon.info.dt$obs_count[i]
+  
+  p[i] <- binom.test(obs, n.sample, p = mut, alternative = "greater")$p.value
+  
+}
+
+codon.info.dt$signif_score <- p
+
+```
+
+Holm-Bonferroni and benjamini.hochberg method of selecting significant p values:
+```{r}
+
+
+holm.bonferroni <- function(dt, alpha) {
+  
+  m <- nrow(dt)
+  
+  #sort the data table by p-values:
+  dt <- dt[order(signif_score), ]
+  
+  #add a column representing the row index after sorting:
+  dt$k <- 1:m
+  k <- 1:m
+  
+  #add a column representing the agjusted alpha:
+  dt$apf_hb <- alpha / (m + 1 - k)
+  
+  #calculate the maximum row index satisfying the condition:
+  max.ind <- with(dt, sum(signif_score < apf_hb))
+  
+  return(dt[1:max.ind, ])
+}
+
+benjamini.hochberg <- function(dt, q) {
+  
+  m <- nrow(dt)
+  
+  #sort the data table by p-values:
+  dt <- dt[order(signif_score), ]
+  
+  #add a column representing the row index after sorting:
+  dt$k <- 1:m
+  k <- 1:m
+  
+  #add a column representing the agjusted alpha:
+  dt$alpha_bh <- k * q / m
+  
+  #calculate the maximum row index satisfying the condition:
+  max.ind <- with(dt, sum(signif_score < alpha_bh))
+  
+  return(dt[1:max.ind, ])
+}
+
+
+```
+
+Filter significant codons:
+```{r}
+
+codon.info.dt <- data.table(codon.info.dt)
+
+hb.dt <- holm.bonferroni(codon.info.dt, 0.05)
+bh.dt <- benjamini.hochberg(codon.info.dt, 0.05)
+
+```
+
+Explore the significant codons fitered by the HB and BH methods:
+```{r}
+
+nrow(hb.dt)
+nrow(bh.dt)
+
+```
+```{r}
+
+sum(hb.dt$signif_score == 0)
+sum(bh.dt$signif_score == 0)
+
+```
+
+Find the driver codons identified by BH but not HB:
+```{r}
+
+table3 <- bh.dt[! codon %in% hb.dt$codon]
+
+```
+
+Mark the codons in genie dataset as Driver, or Passenger
+```{r}
+codon.bh <- bh.dt$codon
+
+num.mutations <- nrow(point.mut.dt)
+driver_status_pred <- numeric(num.mutations)
+
+for(i in 1:num.mutations) {
+  
+  codon.i <- point.mut.dt$codon[i]
+  
+  if(codon.i %in% codon.bh) {
+    driver_status_pred[i] <- "Driver"
+  }
+  else {
+    driver_status_pred[i] <- "Passenger"
+  }
+}
+
+point.mut.dt$driver_status_pred <- driver_status_pred
+
+```
+
+Get the data table of mutations in driver codons:
+```{r}
+
+driver.codon.dt <- point.mut.dt[driver_status_pred == "Driver"]
+
+```
+
+barplot of the number of potential driver mutations in each chromosome:
+```{r}
+
+# the number of potential driver mutations in each chromosome:
+chrom.pdm <- driver.codon.dt %>%
+  group_by(Chromosome) %>%
+  summarize(pdm_chrom = n())
+
+c1 <- c(rep("pink", 20), rep("deeppink", 3))
+ggplot(data = chrom.pdm, aes(x = reorder(Chromosome, pdm_chrom),
+                             y = pdm_chrom)) +
+  geom_bar(position = "dodge", stat = "identity", fill = c1) +
+  coord_flip() +
+  ylab("the Number of Potential Driver Mutations") +
+  xlab("Chromosome") +
+  ggtitle("the Number of Potential Driver Mutations in Each Chromosome")
+
+```
+
+barplot of the number of driver codons in each chromosome:
+```{r}
+
+# the number of driver codons in each chromosome:
+chrom.dc <- driver.codon.dt %>%
+  group_by(Chromosome) %>%
+  summarize(dc_chrom = length(unique(codon)))
+
+c2 <- c(rep("yellow", 20), rep("orange", 3))
+ggplot(data = chrom.dc, aes(x = reorder(Chromosome, dc_chrom),
+                             y = dc_chrom)) +
+  geom_bar(position = "dodge", stat = "identity", fill = c2) +
+  coord_flip() +
+  ylab("the Number of Driver Codons") +
+  xlab("Chromosome") +
+  ggtitle("the Number of Driver Codons in Each Chromosome")
+
+
+```
+
+Find genes with the most number of driver codons:
+TP53 142	
+PTEN 81	
+SMAD4 57
+CDKN2A 53	
+PIK3CA 50	
+```{r}
+
+dc.gene.dt <- driver.codon.dt %>%
+  group_by(Hugo_Symbol) %>%
+  summarize(dc_gene = length(unique(codon))) %>%
+  arrange(desc(dc_gene))
+
+```
+
+Construct data table for lollipop diagrams:
+```{r}
+
+gene.list <- c("TP53", "PTEN", "SMAD4", "CDKN2A", "PIK3CA")
+five.gene.dt <- driver.codon.dt[Hugo_Symbol %in% gene.list]
+
+extract_pat2 <- function(str) {
+  return(stringr::str_match(str, "p\\.([[:upper:]]+\\d+[[:upper:]]+)")[2])
+}
+
+five.gene.dt$Protein_Change <- unlist(lapply(five.gene.dt$HGVSp_Short, extract_pat2))
+
+lolli.dt <- five.gene.dt[, c("Hugo_Symbol", "Protein_Change", "Chromosome", "Start_Position",
+                             "End_Position", "Reference_Allele", 
+                             "Tumor_Seq_Allele2", "Tumor_Sample_Barcode")]
+
+lolli.dt <- setNames(lolli.dt, c("Hugo_Symbol", "Protein_Change", "Chromosome",
+                                 "Start_Position", "End_Position", "Reference_Allele",
+                                 "Variant_Allele", "Sample_ID"))
+
+
+write.table(lolli.dt, "lolli.txt", sep = "\t", row.names = F, quote = F)
+
+```
+
+Prepare for the rainfall plot for all missense SNPs:
+```{r}
+
+somatic.mutations <- point.mut.dt[, c("Tumor_Sample_Barcode", "Variant_Type",
+                    "Chromosome", "Start_Position", "End_Position",
+                    "Reference_Allele", "Tumor_Seq_Allele2")]
+
+somatic.mutations <- setNames(somatic.mutations, c("sample", "mut.type", "chr", "start", "end", "ref", "alt"))
+
+somatic.mutations$origin <- "ORIGINAL-DATA"
+somatic.mutations$mut.type <- "subs"
+
+```
+
+transform the format of data:
+```{r}
+
+sm.gr <- toGRanges(somatic.mutations[, c("chr", "start", "end", "mut.type", "ref", "alt")])
+seqlevelsStyle(sm.gr) <- "UCSC"
+sm.gr
+
+```
+
+get the rainfall plot:
+```{r}
+
+variant.colors <- getVariantsColors(sm.gr$ref, sm.gr$alt)
+pp <- getDefaultPlotParams(plot.type = 4)
+pp$data1inmargin <- 0
+pp$bottommargin <- 20
+
+kp <- plotKaryotype(plot.type=4, ideogram.plotter = NULL,
+                    labels.plotter = NULL, plot.params = pp)
+kpAddCytobandsAsLine(kp)
+kpAddChromosomeNames(kp, srt=90)
+kpAddMainTitle(kp, main="Missense SNP Mutations", cex=1.2)
+kpPlotRainfall(kp, data = sm.gr, col=variant.colors, r0=0, r1=0.7)
+kpAxis(kp, ymax = 7, tick.pos = 1:7, r0=0, r1=0.7)
+kpAddLabels(kp, labels = c("Density"), srt=90, pos=1, label.margin = 0.04, r0=0.71, r1=1)
+kpPlotDensity(kp, data = sm.gr, r0=0.72, r1=1)
+kpAddLabels(kp, labels = c("Distance between Mutations (log10)"), srt=90, pos=2, label.margin = 0.04, r0=0.6, r1=0.8)
+
+
+
+```
+
+## TCGA Data
+Repeat the same procedures for the test dataset:
+
+Filter point mutations:
+```{r}
+
+point.tcga.dt <- tcga.dt[Variant_Classification == "Missense_Mutation" & 
+           Variant_Type == "SNP",]
+stopifnot(point.tcga.dt$Start_Position == point.tcga.dt$End_Position)
+
+```
+
+Investigate the number of missing values:
+```{r}
+
+sum(is.na(point.tcga.dt$HGVSp_Short))
+sum(point.tcga.dt$HGVSp_Short == "")
+
+sum(is.na(point.tcga.dt$Hugo_Symbol))
+sum(point.tcga.dt$Hugo_Symbol == "")
+
+```
+
+construct the codon column in the test dataset:
+```{r}
+
+point.tcga.dt$codon <- unlist(lapply(point.tcga.dt$HGVSp_Short, extract_pat))
+point.tcga.dt$codon <- paste(point.tcga.dt$Hugo_Symbol, point.tcga.dt$codon, sep = "_")
+
+```
+
+compare the unique values of codon columns in the two datasets (relatively little overlap):
+```{r}
+
+length(intersect(point.tcga.dt$codon, pickle.dt$codon))
+length(unique(point.tcga.dt$codon))
+nrow(point.tcga.dt)
+
+```
+
+merge the test dataset with the codon-mutability data table:
+```{r}
+
+tcga.mut.dt <- merge(point.tcga.dt, pickle.dt, by = "codon")
+
+```
+
+```{r}
+
+length(intersect(tcga.mut.dt$codon, point.mut.dt$codon))
+
+```
+
+check missing values:
+```{r}
+
+sum(is.na(tcga.mut.dt$codon))
+sum(is.na(tcga.mut.dt$mutability))
+
+sum(tcga.mut.dt$codon == "")
+sum(tcga.mut.dt$mutability == "")
+
+length(unique(tcga.mut.dt$codon))
+
+
+```
+
+calculate the observed number of mutations in each codon:
+```{r}
+
+codon.obs.tcga <- tcga.mut.dt %>%
+  group_by(codon) %>%
+  summarize(obs_count = n())
+
+```
+construct a data table with codon, obs.count, mutability:
+```{r}
+
+codon.info.tcga <- merge(codon.obs.tcga, pickle.dt, by = "codon")
+
+```
+
+add expect.count column:
+```{r}
+
+n.sample <- nrow(tcga.mut.dt)
+codon.info.tcga$expect_count <- codon.info.tcga$mutability * n.sample
+
+```
+
+calculate significance scores:
+```{r}
+
+num.codon.tcga <- nrow(codon.info.tcga)
+p <- numeric(num.codon.tcga)
+
+for(i in 1:num.codon.tcga) {
+  mut <- codon.info.tcga$mutability[i]
+  obs <- codon.info.tcga$obs_count[i]
+  
+  p[i] <- binom.test(obs, n.sample, p = mut, alternative = "greater")$p.value
+  
+}
+
+codon.info.tcga$signif_score <- p
+
+```
+
+Filter significant codons for the test file:
+```{r}
+
+codon.info.tcga <- data.table(codon.info.tcga)
+hb.tcga.dt <- holm.bonferroni(codon.info.tcga, 0.05)
+bh.tcga.dt <- benjamini.hochberg(codon.info.tcga, 0.05)
+
+```
+
+Explore the significant codons fitered by the HB and BH methods:
+```{r}
+
+nrow(bh.tcga.dt) - nrow(hb.tcga.dt)
+
+nrow(hb.tcga.dt)
+nrow(bh.tcga.dt)
+```
+
+find codons that are indentified as driver in both GENIE and tcga file:
+```{r}
+both.driver.list <- intersect(bh.dt$codon, bh.tcga.dt$codon)
+length(both.driver.list)
+```
+
+Find the codons which are indentified as driver merely in one dataset:
+```{r}
+
+nondriver.tcga <- setdiff(codon.info.tcga$codon, bh.tcga.dt$codon)
+either.genie.list <- intersect(nondriver.tcga, bh.dt$codon)
+
+nondriver.genie <- setdiff(codon.info.dt$codon, bh.dt$codon)
+either.tcga.list <- intersect(nondriver.genie, bh.tcga.dt$codon)
+
+```
+
+passengers identified in both datasets:
+```{r}
+
+both.passenger.list <- intersect(nondriver.genie, nondriver.tcga)
+
+```
+
+Calculate the number of driver codons identified in GENIE and analyzed in TCGA:
+```{r}
+
+length(intersect(bh.dt$codon, tcga.mut.dt$codon))
+
+```
+
+Calculate the number of passenger codons identified in GENIE and analyzed in TCGA:
+```{r}
+
+length(intersect(nondriver.genie, tcga.mut.dt$codon))
+
+```
+
+Find the start and end locations of human chromosomes (construct the coord file):
+```{r}
+
+data(human_karyotype, package="RIdeogram")
+chrom.loc.dt <- human_karyotype[, c("Chr", "Start", "End", "CE_start")]
+write.table(chrom.loc.dt, "chrom_loc.txt", sep = "\t", row.names = F, col.names = F)
+
+```
+
+Merge the location dataset with
+```{r}
+
+data1 <- merge(chrom.loc.dt, point.mut.dt, by.x = "Chr", by.y = "Chromosome")
+data2 <- merge(chrom.loc.dt, tcga.mut.dt, by.x = "Chr", by.y = "Chromosome")
+
+data1 <- data.table(data1)
+data2 <- data.table(data2)
+
+```
+
+Construct annotation data table of codons identified as driver by both datasets:
+```{r}
+annot.both.genie <- data1[codon %in% both.driver.list, c("HGVSp_Short", "Chr", 
+                                     "Start_Position", "End_Position")] %>%
+  distinct()
+
+write.table(annot.both.genie, "annot_both_genie.txt", sep = "\t", row.names = F, col.names = F)
+
+```
+
+```{r}
+annot.both.tcga <- data2[codon %in% both.driver.list, c("HGVSp_Short", "Chr", 
+                                     "Start_Position", "End_Position")] %>%
+  distinct()
+
+write.table(annot.both.tcga, "annot_both_tcga.txt", sep = "\t", row.names = F, col.names = F)
+
+```
+
+Mark the driver hotspots identified by both datasets on chromosomes:
+```{r}
+
+chromoMap("chrom_loc.txt", "annot_both_genie.txt", segment_annotation = T,
+          chr_color = "blue",
+          title = "Locations of Mutation Hotspots Identified in Both Datasets")
+
+```
+
+```{r}
+
+chromoMap("chrom_loc.txt", "annot_both_tcga.txt", segment_annotation = T,
+          labels = T)
+
+```
+
+Construct annotation data table of codons identified as driver by GENIE but not TCGA:
+```{r}
+annot.either.genie.1 <- data1[codon %in% either.genie.list, c("HGVSp_Short", "Chr", 
+                                     "Start_Position", "End_Position")] %>%
+  distinct()
+
+write.table(annot.either.genie.1, "annot_either_genie_1.txt", sep = "\t", row.names = F, col.names = F)
+
+```
+
+```{r}
+annot.either.genie.2 <- data2[codon %in% either.genie.list, c("HGVSp_Short", "Chr", 
+                                     "Start_Position", "End_Position")] %>%
+  distinct()
+
+write.table(annot.either.genie.2, "annot_either_genie_2.txt", sep = "\t", row.names = F, col.names = F)
+
+```
+
+Mark the driver hotspots identified by GENIE but not TCGA:
+```{r}
+
+chromoMap("chrom_loc.txt", "annot_either_genie_1.txt", segment_annotation = T,
+          chr_color = "blue",
+          title = "Locations of Mutation Hotspots Identified in GENIE but not TCGA")
+
+```
+
+```{r}
+
+chromoMap("chrom_loc.txt", "annot_either_genie_2.txt", segment_annotation = T,
+          labels = T)
+
+```
+
+Construct annotation data table of codons identified as driver by TCGA but not GENIE:
+```{r}
+annot.either.tcga.1 <- data1[codon %in% either.tcga.list, c("HGVSp_Short", "Chr", 
+                                     "Start_Position", "End_Position")] %>%
+  distinct()
+
+write.table(annot.either.tcga.1, "annot_either_tcga_1.txt", sep = "\t", row.names = F, col.names = F)
+
+```
+
+```{r}
+annot.either.tcga.2 <- data2[codon %in% either.tcga.list, c("HGVSp_Short", "Chr", 
+                                     "Start_Position", "End_Position")] %>%
+  distinct()
+
+write.table(annot.either.tcga.2, "annot_either_tcga_2.txt", sep = "\t", row.names = F, col.names = F)
+
+```
+
+Mark the driver hotspots identified by TCGA but not GENIE:
+```{r}
+
+chromoMap("chrom_loc.txt", "annot_either_tcga_1.txt", segment_annotation = T,
+          labels = T)
+
+```
+
+```{r}
+
+chromoMap("chrom_loc.txt", "annot_either_tcga_2.txt", segment_annotation = T,
+          labels = T)
+
+```
+
+
+```{r}
+
+write.table(bh.dt, "BH_GENIE.txt", sep = "\t", row.names = F)
+write.table(hb.dt, "HB_GENIE.txt", sep = "\t", row.names = F)
+
+write.table(bh.tcga.dt, "BH_TCGA.txt", sep = "\t", row.names = F)
+write.table(hb.tcga.dt, "HB_TCGA.txt", sep = "\t", row.names = F)
+
+
+```
+```{r}
+bh.dt <- data.table(bh.dt)
+write.table(bh.dt[codon %in% both.driver.list], "bh_both_driver.txt", sep = "\t", row.names = F)
+
+```
+
+
+
+
+
+
+
+
+
+
+
